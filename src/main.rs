@@ -10,7 +10,11 @@
 use std::io::Write;
 use std::process::Command;
 
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
+
+// After a suspend the clock can jump; replay at most this many missed minutes so a
+// long outage (device off for hours) can't fire a storm of stale jobs on wake.
+const CATCHUP_MAX_MIN: i64 = 60;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -101,8 +105,11 @@ fn parse_line(line: &str) -> R<Option<Entry>> {
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
-    if let Some(cmd) = line.strip_prefix("@reboot") {
-        return Ok(Some(Entry { sched: Schedule::Reboot, cmd: cmd.trim().to_string() }));
+    if let Some(rest) = line.strip_prefix("@reboot") {
+        // require a boundary so "@rebootfoo" isn't parsed as @reboot
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return Ok(Some(Entry { sched: Schedule::Reboot, cmd: rest.trim().to_string() }));
+        }
     }
     // @Ns extension: "@30s echo hi"
     if let Some(rest) = line.strip_prefix('@') {
@@ -118,13 +125,21 @@ fn parse_line(line: &str) -> R<Option<Entry>> {
         }
         return Err(format!("unknown @ spec '{spec}'").into());
     }
-    // 5 fields then the command.
-    let mut parts = line.splitn(6, char::is_whitespace).filter(|s| !s.is_empty());
-    let f: Vec<&str> = (&mut parts).take(5).collect();
-    if f.len() < 5 {
-        return Err(format!("need 5 time fields: '{line}'").into());
+    // Split off exactly 5 whitespace-delimited fields; the rest is the command with its
+    // internal spacing preserved. Tolerates column-aligned crontabs (multiple spaces).
+    let mut rest = line;
+    let mut f = [""; 5];
+    for slot in f.iter_mut() {
+        let end = rest
+            .find(char::is_whitespace)
+            .ok_or_else(|| format!("need 5 time fields + command: '{line}'"))?;
+        *slot = &rest[..end];
+        rest = rest[end..].trim_start();
     }
-    let cmd = parts.next().unwrap_or("").trim().to_string();
+    if rest.is_empty() {
+        return Err(format!("missing command: '{line}'").into());
+    }
+    let cmd = rest.to_string();
     let (min, _) = parse_field(f[0], 0, 59)?;
     let (hour, _) = parse_field(f[1], 0, 23)?;
     let (dom, dom_star) = parse_field(f[2], 1, 31)?;
@@ -219,22 +234,31 @@ fn cmd_run(args: &[String]) -> R<()> {
 
     // Per-entry last-run epoch for @Ns entries.
     let mut last_every = vec![0i64; entries.len()];
-    let mut last_min = -1i64;
+    // Seed with the current minute so the in-progress minute we start inside is not
+    // retro-fired (that would double-fire on a same-minute daemon restart).
+    let mut last_min = Local::now().timestamp().div_euclid(60);
 
     loop {
         let now = Local::now();
         let epoch = now.timestamp();
 
-        // Minute-granularity cron: evaluate once when the minute rolls over.
+        // Cron granularity is one minute. Fire every minute that elapsed since the last
+        // check — after a Doze suspend the clock jumps and those missed minutes must
+        // still run (bounded by CATCHUP_MAX_MIN so a long outage can't storm on wake).
         let this_min = epoch.div_euclid(60);
-        if this_min != last_min {
-            last_min = this_min;
-            for e in &entries {
-                if cron_matches(&e.sched, &now) {
-                    logline(&format!("cron -> {}", e.cmd));
-                    spawn(&e.cmd);
+        if this_min > last_min {
+            let from = (last_min + 1).max(this_min - CATCHUP_MAX_MIN);
+            for m in from..=this_min {
+                if let Some(t) = Local.timestamp_opt(m * 60, 0).single() {
+                    for e in &entries {
+                        if cron_matches(&e.sched, &t) {
+                            logline(&format!("cron -> {}", e.cmd));
+                            spawn(&e.cmd);
+                        }
+                    }
                 }
             }
+            last_min = this_min;
         }
 
         // Sub-minute @Ns entries.
@@ -265,11 +289,8 @@ fn cmd_test(args: &[String]) -> R<()> {
             Schedule::Cron { .. } => {
                 let mut fires = Vec::new();
                 // Scan minute by minute up to ~400 days.
-                let mut t = (start + Duration::minutes(1))
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap();
+                let base = start + Duration::minutes(1);
+                let mut t = base.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(base);
                 for _ in 0..(400 * 24 * 60) {
                     if cron_matches(&e.sched, &t) {
                         fires.push(t.format("%Y-%m-%d %H:%M").to_string());
